@@ -460,6 +460,7 @@ def _core_time_and_size_sddl_chunked(tool, serial_bytes: np.ndarray, record_size
 # Main evaluation
 # ============================================================
 
+
 def test_decomposition(
     data_set: np.ndarray,
     dataset_name: str,
@@ -473,9 +474,12 @@ def test_decomposition(
     if comp_tool_dict is None:
         comp_tool_dict = {}
 
-    type_byte = np.uint8
     m = int(m)
+    type_byte = np.uint8
 
+    # -----------------------------
+    # Choose decompositions
+    # -----------------------------
     if given_decomp is None:
         all_possible = possible_sum(m)
         all_decomps, total_enum = find_all_combinations(all_possible, m, contig_order)
@@ -483,25 +487,98 @@ def test_decomposition(
         all_decomps = list(given_decomp)
         total_enum = len(all_decomps)
 
-    data_set_bytes = data_set.view(type_byte)
-    len_bytes = int(data_set_bytes.nbytes)
+    # -----------------------------
+    # Raw bytes view (no reorder)
+    # -----------------------------
+    x_contig = np.ascontiguousarray(data_set)
+    raw_u8 = x_contig.view(np.uint8)
+    raw_i8 = x_contig.view(np.int8)   #  "standard serial" stream
+    len_bytes = int(raw_u8.nbytes)
 
-    # byte planes, precomputed once
-    comps = np.zeros((m, len(data_set)), dtype=type_byte)
+    # -----------------------------
+    # Byte-planes (b0..b{m-1})
+    # comps[i] = i-th byte of every element
+    # -----------------------------
+    comps = np.zeros((m, x_contig.size), dtype=type_byte)
     for i in range(m):
-        comps[i] = data_set_bytes[i:len_bytes:m]
+        comps[i] = raw_u8[i:len_bytes:m]
 
-    numeric_fallback = comp_tool_dict.get("openzl_serial", None)
+    def ratio(orig: int, comp: int) -> float:
+        return float("inf") if comp == 0 else float(orig) / float(comp)
 
+    def _put(stats: dict, prefix: str, orig_bytes: int, comp_bytes: int, seconds: float, mbps_bytes: int | None = None):
+        stats[f"{prefix}.ratio"] = ratio(orig_bytes, comp_bytes)
+        stats[f"{prefix}.time_s"] = float(seconds)
+        denom = orig_bytes if mbps_bytes is None else int(mbps_bytes)
+        stats[f"{prefix}.MBps"] = _mbps(denom, seconds)
+
+    # -----------------------------
+    # Resolve standard tools
+    # -----------------------------
+    tool_serial = comp_tool_dict.get("openzl_serial", None)
+    tool_numeric = comp_tool_dict.get("openzl_numeric_only", None)
+
+    # float: named it openzl_float_deconstruct_m{m}
+    tool_float = comp_tool_dict.get(f"openzl_float_deconstruct_m{m}", None)
+
+    # standard struct uses struct(m) on the raw bytes stream
     struct_cache = {}
-    packed_struct_cache = {}
-    sddl_groups_cache = {}
-
     def get_struct_tool(group_len: int):
         group_len = int(group_len)
         if group_len not in struct_cache:
             struct_cache[group_len] = _OpenZLSerialToStruct(group_len)
         return struct_cache[group_len]
+
+    tool_struct_std = get_struct_tool(m)
+
+    # standard SDDL: one field of size m (equivalent to 1 stream, record size = m)
+
+    sddl_cache = {}
+    def get_sddl_groups_tool(group_lens):
+        key = tuple(int(x) for x in group_lens)
+        if key not in sddl_cache:
+            sddl_cache[key] = _OpenZLSDDLGroups(key)
+        return sddl_cache[key]
+
+    tool_sddl_std = get_sddl_groups_tool([m])
+
+    # -----------------------------
+    # Compute STANDARD metrics once
+    # -----------------------------
+    standard_metrics = {}
+
+    if tool_serial is not None:
+        sz, dt = _core_time_and_size_serial(tool_serial, [raw_i8])
+        _put(standard_metrics, "standard.serial", len_bytes, sz, dt)
+
+    if tool_numeric is not None:
+        sz, dt = _core_time_and_size_numeric(tool_numeric, x_contig)
+        _put(standard_metrics, "standard.numeric", len_bytes, sz, dt)
+
+    if tool_float is not None:
+        # float tool takes bytes array; it will view to float32/64 internally if aligned
+        sz, dt = _core_time_and_size_serial(tool_float, [raw_i8])
+        _put(standard_metrics, f"standard.float_deconstruct_m{m}", len_bytes, sz, dt)
+
+    # standard struct(m)
+    if tool_struct_std is not None:
+        sz, dt = _core_time_and_size_serial(tool_struct_std, [raw_i8])
+        _put(standard_metrics, f"standard.struct_{m}", len_bytes, sz, dt)
+
+    # standard sddl: record size = m, chunked timing
+    sz, dt, nproc = _core_time_and_size_sddl_chunked(
+        tool_sddl_std, raw_i8, record_size=m, max_records=SDDL_MAX_RECORDS_PER_CHUNK
+    )
+    if SDDL_MBPS_DENOM == "orig":
+        _put(standard_metrics, f"standard.sddl_{m}", len_bytes, sz, dt, mbps_bytes=len_bytes)
+    else:
+        _put(standard_metrics, f"standard.sddl_{m}", len_bytes, sz, dt, mbps_bytes=nproc)
+
+    # -----------------------------
+    # Decomposition loop (DECOMP metrics only)
+    # -----------------------------
+    stat_array = []
+    packed_struct_cache = {}
 
     def get_packed_struct_tool(K: int):
         K = int(K)
@@ -509,162 +586,111 @@ def test_decomposition(
             packed_struct_cache[K] = _OpenZLPackedStruct(K)
         return packed_struct_cache[K]
 
-    def get_sddl_groups_tool(group_lens):
-        key = tuple(int(x) for x in group_lens)
-        if key not in sddl_groups_cache:
-            sddl_groups_cache[key] = _OpenZLSDDLGroups(key)
-        return sddl_groups_cache[key]
-
-    def ratio(orig: int, comp: int) -> float:
-        return float("inf") if comp == 0 else float(orig) / float(comp)
-
-    # Precompute standard serial bytes once (for standard serial/zstd/struct(K) style)
-    std_serial_F = np.frombuffer(data_set.flatten("F").tobytes(), dtype=np.byte)
-
-    stat_array = []
     for idx, decomp in enumerate(all_decomps):
         stats = {
-            "dataset name": dataset_name,
-            "original size": len_bytes,
-            "type width": m,
-            "Dimension": int(len(data_set)),
+            "dataset": dataset_name,
+            "original_bytes": len_bytes,
+            "m": m,
+            "N": int(x_contig.size),
             "decomposition": tuple_to_string(decomp),
-            "chunk no": int(chunk_no),
+            "chunk_no": int(chunk_no),
         }
 
-        # Build comp_list as byte-group matrices
+        # attach STANDARD results to every row (CSV )
+        stats.update(standard_metrics)
+
+        # ---- build group matrices from byte-planes
         comp_list = []
         group_lens = []
         for group_tuple in decomp:
             group_tuple = tuple(group_tuple)
             gl = len(group_tuple)
             group_lens.append(gl)
-            cur_comp_data = np.zeros((gl, len(data_set)), dtype=type_byte)
+
+            cur = np.zeros((gl, x_contig.size), dtype=type_byte)
             for j, byte_idx in enumerate(group_tuple):
-                cur_comp_data[j] = comps[int(byte_idx)]
-            comp_list.append(cur_comp_data)
+                cur[j] = comps[int(byte_idx)]
+            comp_list.append(cur)
 
         K = int(sum(group_lens))
 
-        # Precompute decomposed serial byte arrays for col/row orders (one per group)
-        decomp_serial_F = []
-        decomp_serial_C = []
-        for chunk in comp_list:
-            decomp_serial_F.append(np.frombuffer(chunk.flatten("F").tobytes(), dtype=np.byte))
-            decomp_serial_C.append(np.frombuffer(chunk.flatten("C").tobytes(), dtype=np.byte))
+        # ---- group streams (serial)
+        decomp_serial_F = [np.frombuffer(chunk.flatten("F").tobytes(), dtype=np.int8) for chunk in comp_list]
+        decomp_serial_C = [np.frombuffer(chunk.flatten("C").tobytes(), dtype=np.int8) for chunk in comp_list]
 
-        # Precompute packed matrix + packed bytes (for packed struct, SDDL)
-        packed = np.zeros((K, len(data_set)), dtype=type_byte)
+        # ---- packed stream (for struct_packed + sddl)
+        packed = np.zeros((K, x_contig.size), dtype=type_byte)
         off = 0
         for chunk in comp_list:
             gl = int(chunk.shape[0])
             packed[off:off + gl, :] = chunk
             off += gl
-        packed_bytes_F = np.frombuffer(packed.flatten("F").tobytes(), dtype=np.byte)
-        packed_bytes_C = np.frombuffer(packed.flatten("C").tobytes(), dtype=np.byte)
 
-        # ------------------------------------------------------------
-        # Standard + decomposed for comp_tool_dict items (core time only)
-        # ------------------------------------------------------------
-        for comp_name, comp_tool in comp_tool_dict.items():
-            if comp_name == "openzl_numeric_only":
-                full_comp_size, full_t = _core_time_and_size_numeric(comp_tool, data_set)
-            else:
-                full_comp_size, full_t = _core_time_and_size_serial(comp_tool, [std_serial_F])
+        packed_bytes_F = np.frombuffer(packed.flatten("F").tobytes(), dtype=np.int8)
+        packed_bytes_C = np.frombuffer(packed.flatten("C").tobytes(), dtype=np.int8)
 
-            if comp_name == "openzl_numeric_only":
-                if numeric_fallback is None:
-                    raise RuntimeError("openzl_numeric_only needs openzl_serial as fallback for decomposed chunks")
-                decomp_col, t_col = _core_time_and_size_serial(numeric_fallback, decomp_serial_F)
-                decomp_row, t_row = _core_time_and_size_serial(numeric_fallback, decomp_serial_C)
-            else:
-                decomp_col, t_col = _core_time_and_size_serial(comp_tool, decomp_serial_F)
-                decomp_row, t_row = _core_time_and_size_serial(comp_tool, decomp_serial_C)
+        # -------------------------
+        # DECOMP: serial (col/row)
+        # -------------------------
+        if tool_serial is not None:
+            szF, dtF = _core_time_and_size_serial(tool_serial, decomp_serial_F)
+            szC, dtC = _core_time_and_size_serial(tool_serial, decomp_serial_C)
+            _put(stats, "decomp.serial.col", len_bytes, szF, dtF)
+            _put(stats, "decomp.serial.row", len_bytes, szC, dtC)
 
-            stats[f"standard {comp_name} ratio"] = ratio(len_bytes, full_comp_size)
-            stats[f"decomposed {comp_name} col-order ratio"] = ratio(len_bytes, decomp_col)
-            stats[f"decomposed {comp_name} row-order ratio"] = ratio(len_bytes, decomp_row)
-
-            stats[f"standard {comp_name} time s"] = float(full_t)
-            stats[f"standard {comp_name} MB/s"] = _mbps(len_bytes, full_t)
-
-            stats[f"decomposed {comp_name} col-order time s"] = float(t_col)
-            stats[f"decomposed {comp_name} col-order MB/s"] = _mbps(len_bytes, t_col)
-
-            stats[f"decomposed {comp_name} row-order time s"] = float(t_row)
-            stats[f"decomposed {comp_name} row-order MB/s"] = _mbps(len_bytes, t_row)
-
-        # ------------------------------------------------------------
-        # Struct-groups (sum over groups), core time only
-        # ------------------------------------------------------------
-        struct_sum_col = 0
-        struct_sum_row = 0
-        t_struct_col = 0.0
-        t_struct_row = 0.0
+        # -------------------------
+        # DECOMP: struct_groups (col/row)
+        # Note: sums group-by-group times (as your original)
+        # -------------------------
+        struct_sum_F = 0
+        struct_sum_C = 0
+        t_struct_F = 0.0
+        t_struct_C = 0.0
 
         for chunk_bytes, chunk in zip(decomp_serial_F, comp_list):
             gl = int(chunk.shape[0])
             tool = get_struct_tool(gl)
             sz, dt = _core_time_and_size_serial(tool, [chunk_bytes])
-            struct_sum_col += sz
-            t_struct_col += dt
+            struct_sum_F += sz
+            t_struct_F += dt
 
         for chunk_bytes, chunk in zip(decomp_serial_C, comp_list):
             gl = int(chunk.shape[0])
             tool = get_struct_tool(gl)
             sz, dt = _core_time_and_size_serial(tool, [chunk_bytes])
-            struct_sum_row += sz
-            t_struct_row += dt
+            struct_sum_C += sz
+            t_struct_C += dt
 
-        stats["decomposed openzl_struct_groups col-order ratio"] = ratio(len_bytes, struct_sum_col)
-        stats["decomposed openzl_struct_groups row-order ratio"] = ratio(len_bytes, struct_sum_row)
+        _put(stats, "decomp.struct_groups.col", len_bytes, struct_sum_F, t_struct_F)
+        _put(stats, "decomp.struct_groups.row", len_bytes, struct_sum_C, t_struct_C)
 
-        stats["decomposed openzl_struct_groups col-order time s"] = float(t_struct_col)
-        stats["decomposed openzl_struct_groups col-order MB/s"] = _mbps(len_bytes, t_struct_col)
-
-        stats["decomposed openzl_struct_groups row-order time s"] = float(t_struct_row)
-        stats["decomposed openzl_struct_groups row-order MB/s"] = _mbps(len_bytes, t_struct_row)
-
-        # ------------------------------------------------------------
-        # Packed-struct (single stream struct(K)), core time only
-        # ------------------------------------------------------------
+        # -------------------------
+        # DECOMP: struct_packed (col/row)
+        # -------------------------
         packed_tool = get_packed_struct_tool(K)
-        packed_col, t_packed_col = _core_time_and_size_serial(packed_tool, [packed_bytes_F])
-        packed_row, t_packed_row = _core_time_and_size_serial(packed_tool, [packed_bytes_C])
+        szF, dtF = _core_time_and_size_serial(packed_tool, [packed_bytes_F])
+        szC, dtC = _core_time_and_size_serial(packed_tool, [packed_bytes_C])
+        _put(stats, "decomp.struct_packed.col", len_bytes, szF, dtF)
+        _put(stats, "decomp.struct_packed.row", len_bytes, szC, dtC)
 
-        stats["decomposed openzl_struct_packed col-order ratio"] = ratio(len_bytes, packed_col)
-        stats["decomposed openzl_struct_packed row-order ratio"] = ratio(len_bytes, packed_row)
-
-        stats["decomposed openzl_struct_packed col-order time s"] = float(t_packed_col)
-        stats["decomposed openzl_struct_packed col-order MB/s"] = _mbps(len_bytes, t_packed_col)
-
-        stats["decomposed openzl_struct_packed row-order time s"] = float(t_packed_row)
-        stats["decomposed openzl_struct_packed row-order MB/s"] = _mbps(len_bytes, t_packed_row)
-
-        # ------------------------------------------------------------
-        # SDDL multi-stream over packed layout, chunked, core time only
-        # ------------------------------------------------------------
+        # -------------------------
+        # DECOMP: SDDL groups (col/row), chunked, record_size=K
+        # -------------------------
         sddl_tool = get_sddl_groups_tool(group_lens)
 
-        sddl_size_F, t_sddl_F, nproc_F = _core_time_and_size_sddl_chunked(
+        szF, dtF, nprocF = _core_time_and_size_sddl_chunked(
             sddl_tool, packed_bytes_F, record_size=K, max_records=SDDL_MAX_RECORDS_PER_CHUNK
         )
-        sddl_size_C, t_sddl_C, nproc_C = _core_time_and_size_sddl_chunked(
+        szC, dtC, nprocC = _core_time_and_size_sddl_chunked(
             sddl_tool, packed_bytes_C, record_size=K, max_records=SDDL_MAX_RECORDS_PER_CHUNK
         )
 
-        stats["decomposed openzl_sddl_groups col-order ratio"] = ratio(len_bytes, sddl_size_F)
-        stats["decomposed openzl_sddl_groups row-order ratio"] = ratio(len_bytes, sddl_size_C)
-
-        stats["decomposed openzl_sddl_groups col-order time s"] = float(t_sddl_F)
-        stats["decomposed openzl_sddl_groups row-order time s"] = float(t_sddl_C)
-
         if SDDL_MBPS_DENOM == "orig":
-            stats["decomposed openzl_sddl_groups col-order MB/s"] = _mbps(len_bytes, t_sddl_F)
-            stats["decomposed openzl_sddl_groups row-order MB/s"] = _mbps(len_bytes, t_sddl_C)
+            _put(stats, "decomp.sddl.col", len_bytes, szF, dtF, mbps_bytes=len_bytes)
+            _put(stats, "decomp.sddl.row", len_bytes, szC, dtC, mbps_bytes=len_bytes)
         else:
-            stats["decomposed openzl_sddl_groups col-order MB/s"] = _mbps(nproc_F, t_sddl_F)
-            stats["decomposed openzl_sddl_groups row-order MB/s"] = _mbps(nproc_C, t_sddl_C)
+            _put(stats, "decomp.sddl.col", len_bytes, szF, dtF, mbps_bytes=nprocF)
+            _put(stats, "decomp.sddl.row", len_bytes, szC, dtC, mbps_bytes=nprocC)
 
         stat_array.append(stats)
 
@@ -674,8 +700,6 @@ def test_decomposition(
             pd.DataFrame(stat_array).to_csv(out_csv, index=False)
 
     return stat_array
-
-
 def main():
     dataset_folder = "/home/jamalids/Documents/2D/data1/Fcbench/Fcbench-dataset/32"
     m = 4
@@ -734,7 +758,7 @@ def main():
             comp_tool_dict=comp_tool_dict,
             given_decomp=converted_decomps,
             contig_order=contig_order,
-            out_log_dir="/home/jamalids/Documents/4",
+            out_log_dir="/home/jamalids/Documents/6",
         )
         print(f"Done: wrote stats in /home/jamalids/Documents/4/{dataset_name}_decomposition_stats.csv")
 
