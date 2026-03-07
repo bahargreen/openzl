@@ -2,6 +2,10 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmakebuild/tools/ml_selector/xgboost_external-prefix/src/xgboost_external" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmakebuild/tools/ml_selector/xgboost_external-prefix/src/xgboost_external/dmlc-core" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/deps/lz4" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/deps/zstd" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/doc/mkdocs/src" vcs="Git" />
   </component>
 </project>
