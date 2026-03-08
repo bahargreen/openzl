@@ -6,9 +6,9 @@ Helpers for:
 - compression/decompression core timing
 - packed-byte reconstruction to float arrays
 
-Designed to work with the simplified main script that keeps only:
-- standard SDDL
-- grouped/decomposed SDDL
+Optimized:
+- detects no-reorder decompositions
+- uses faster full-restore path when grouped layout is identical to original byte order
 """
 
 import time
@@ -24,7 +24,6 @@ except Exception:
 
 # ============================================================
 # Global timing/config defaults
-# These can be overridden from main script.
 # ============================================================
 
 N_WARMUP = 1
@@ -55,12 +54,72 @@ def _median_time(callable_fn) -> float:
 
 
 # ============================================================
+# Layout helpers
+# ============================================================
+
+def _is_no_reorder_decomp(decomp, m: int) -> bool:
+    """
+    True only if decomposition preserves original byte order exactly,
+    only changing contiguous group boundaries.
+
+    True examples:
+      ((0,1),(2,),(3,))
+      ((0,),(1,2),(3,))
+      ((0,1,2,3),)
+
+    False examples:
+      ((3,),(0,1,2))
+      ((0,2),(1,3))
+    """
+    flat = []
+    for group in decomp:
+        g = tuple(int(x) for x in group)
+        if len(g) == 0:
+            return False
+        if g != tuple(range(g[0], g[0] + len(g))):
+            return False
+        flat.extend(g)
+
+    return flat == list(range(m))
+
+
+def _byte_planes_view(data_set: np.ndarray, m: int) -> np.ndarray:
+    """
+    Zero-copy byte-plane view with shape (m, n).
+    """
+    n = int(len(data_set))
+    u8 = data_set.view(np.uint8).reshape(n, m)
+    return u8.T
+
+
+def _build_grouped_packed_bytes_col_fast(
+    byte_planes: np.ndarray,
+    decomp,
+) -> tuple[np.ndarray, list[int], int]:
+    """
+    Build grouped packed bytes in col-order.
+    Uses a single concatenate when reorder is actually needed.
+
+    Returns:
+        packed_bytes_F : 1-D np.byte
+        group_lens     : list[int]
+        K              : total packed width
+    """
+    group_lens = [len(tuple(g)) for g in decomp]
+    K = int(sum(group_lens))
+
+    grouped_rows = [byte_planes[list(tuple(g)), :] for g in decomp]
+    packed = np.concatenate(grouped_rows, axis=0)
+    packed_bytes_F = np.frombuffer(packed.tobytes(order="F"), dtype=np.byte)
+    return packed_bytes_F, group_lens, K
+
+
+# ============================================================
 # Core compression timing
 # ============================================================
 
 def _core_time_and_size_sddl_chunked(tool, serial_bytes: np.ndarray, record_size: int, max_records: int):
     """
-    serial_bytes is already prepared np.byte 1-D array.
     Measures only tool(chunk) time, not serial_bytes creation.
 
     Returns:
@@ -129,8 +188,7 @@ def _core_time_and_check_decompress_sddl_chunked(
     max_records: int,
 ) -> tuple[int, float, int]:
     """
-    Compress chunk-by-chunk using SDDL tool, then measure chunk-by-chunk
-    decompression time. Measures only OpenZL decompression time.
+    Compress chunk-by-chunk, then measure only OpenZL decompression time.
 
     Returns:
         (compressed_total_size, decomp_time_s, nbytes_aligned)
@@ -199,10 +257,6 @@ def _make_sddl_record_from_group_lens(group_lens) -> str:
 
 
 class _SDDLSuccessorN(zl.FunctionGraph):
-    """
-    Successor graph for SDDL fields.
-    Routes each SDDL field to a Compress graph.
-    """
     def __init__(self, num_groups: int):
         super().__init__()
         self._num_groups = int(num_groups)
@@ -266,9 +320,6 @@ class _OpenZLSDDLGroups:
 class _OpenZLSDDLStandard:
     """
     Standard SDDL: one record per original element, as Byte[m].
-    Example:
-      float32 -> Byte[4]
-      float64 -> Byte[8]
     """
     def __init__(self, m: int):
         if not _HAS_OPENZL:
@@ -308,6 +359,19 @@ Rec = {{
 # Reconstruction helpers
 # ============================================================
 
+def _restore_no_reorder_bytes_to_array(
+    packed_serial: bytes,
+    n: int,
+    dtype,
+) -> np.ndarray:
+    """
+    Fast path when grouped layout is identical to original byte order.
+    No inverse grouping needed.
+    """
+    arr = np.frombuffer(packed_serial, dtype=dtype, count=n)
+    return arr.copy()
+
+
 def _unpack_tdt_packed_bytes_to_float(
     packed_serial: bytes,
     group_lens,
@@ -318,16 +382,6 @@ def _unpack_tdt_packed_bytes_to_float(
     """
     Reverse grouped/decomposed packing when packed bytes were produced with:
         packed.flatten("F")
-
-    Input:
-        packed_serial: bytes containing K*n bytes
-        group_lens: e.g. [2,1,1]
-        decomp: e.g. ((0,1),(2,),(3,))
-        n: number of original elements in this packed chunk
-        dtype: np.float32 or np.float64
-
-    Returns:
-        restored 1-D float array of length n
     """
     K = int(sum(group_lens))
     buf = np.frombuffer(packed_serial, dtype=np.uint8)
@@ -352,3 +406,30 @@ def _unpack_tdt_packed_bytes_to_float(
         raw[i:m * n:m] = comps_recovered[i]
 
     return raw.view(dtype)
+
+
+def _restore_grouped_bytes_to_array(
+    packed_serial: bytes,
+    group_lens,
+    decomp,
+    n: int,
+    dtype,
+    no_reorder_layout: bool,
+) -> np.ndarray:
+    """
+    Unified restore entry point.
+    """
+    if no_reorder_layout:
+        return _restore_no_reorder_bytes_to_array(
+            packed_serial=packed_serial,
+            n=n,
+            dtype=dtype,
+        )
+
+    return _unpack_tdt_packed_bytes_to_float(
+        packed_serial=packed_serial,
+        group_lens=group_lens,
+        decomp=decomp,
+        n=n,
+        dtype=dtype,
+    )

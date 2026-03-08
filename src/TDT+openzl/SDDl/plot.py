@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ====== change this ======
-INPUT_DIR = Path("/home/jamalids/Documents/7")
+INPUT_DIR = Path("/home/jamalids/Documents/8")
 PATTERN = "*_decomposition_stats.csv"
 
 OUT_CSV = INPUT_DIR / "merged_standard_vs_tdt.csv"

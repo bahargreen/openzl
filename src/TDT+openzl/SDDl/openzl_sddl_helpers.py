@@ -3,12 +3,13 @@
 Helpers for:
 - standard SDDL
 - grouped/decomposed SDDL
+- grouped/decomposed Struct with separate streams
 - compression/decompression core timing
 - packed-byte reconstruction to float arrays
 
-Optimized:
-- detects no-reorder decompositions
-- uses faster full-restore path when grouped layout is identical to original byte order
+Notes:
+- Struct path uses zl.nodes.ConvertSerialToStruct(...)
+- This helper is cleaned for GROUP struct mode
 """
 
 import time
@@ -61,15 +62,6 @@ def _is_no_reorder_decomp(decomp, m: int) -> bool:
     """
     True only if decomposition preserves original byte order exactly,
     only changing contiguous group boundaries.
-
-    True examples:
-      ((0,1),(2,),(3,))
-      ((0,),(1,2),(3,))
-      ((0,1,2,3),)
-
-    False examples:
-      ((3,),(0,1,2))
-      ((0,2),(1,3))
     """
     flat = []
     for group in decomp:
@@ -98,7 +90,6 @@ def _build_grouped_packed_bytes_col_fast(
 ) -> tuple[np.ndarray, list[int], int]:
     """
     Build grouped packed bytes in col-order.
-    Uses a single concatenate when reorder is actually needed.
 
     Returns:
         packed_bytes_F : 1-D np.byte
@@ -114,11 +105,48 @@ def _build_grouped_packed_bytes_col_fast(
     return packed_bytes_F, group_lens, K
 
 
+def _build_grouped_separate_bytes_col_fast(
+    byte_planes: np.ndarray,
+    decomp,
+) -> tuple[list[np.ndarray], list[int]]:
+    """
+    Build one separate serial byte stream per group.
+
+    For each group g with length gl:
+        part shape = (gl, n)
+        stream = part.T.reshape(-1)   -> records of width gl
+
+    Returns:
+        separated_streams : list[np.ndarray]
+        group_lens        : list[int]
+    """
+    separated_streams = []
+    group_lens = []
+
+    for group in decomp:
+        group = tuple(int(x) for x in group)
+        gl = len(group)
+        if gl <= 0:
+            raise ValueError("Empty group in decomposition")
+
+        part = byte_planes[list(group), :]   # shape (gl, n)
+        serial = np.ascontiguousarray(part.T.reshape(-1), dtype=np.byte)
+        separated_streams.append(serial)
+        group_lens.append(gl)
+
+    return separated_streams, group_lens
+
+
 # ============================================================
 # Core compression timing
 # ============================================================
 
-def _core_time_and_size_sddl_chunked(tool, serial_bytes: np.ndarray, record_size: int, max_records: int):
+def _core_time_and_size_sddl_chunked(
+    tool,
+    serial_bytes: np.ndarray,
+    record_size: int,
+    max_records: int,
+):
     """
     Measures only tool(chunk) time, not serial_bytes creation.
 
@@ -218,7 +246,7 @@ def _core_time_and_check_decompress_sddl_chunked(
 
         regen = _decompress_serial_bytes(comp)
         if regen != chunk.tobytes(order="C"):
-            raise RuntimeError("SDDL decompression mismatch / corruption detected")
+            raise RuntimeError("Decompression mismatch / corruption detected")
 
         compressed_chunks.append(comp)
         off = end
@@ -356,6 +384,45 @@ Rec = {{
 
 
 # ============================================================
+# Struct graph builder for group mode
+# ============================================================
+
+class _OpenZLStructStandard:
+    """
+    Serial -> struct(record_size) -> Compress
+
+    Uses zl.nodes.ConvertSerialToStruct(...), which is the working API
+    in your OpenZL binding.
+    """
+    def __init__(self, record_size: int):
+        if not _HAS_OPENZL:
+            raise RuntimeError("OpenZL not available")
+
+        self.record_size = int(record_size)
+        if self.record_size < 1:
+            raise ValueError("record_size must be >= 1")
+
+        self._comp = zl.Compressor()
+        gid = zl.nodes.ConvertSerialToStruct(struct_size_bytes=self.record_size)(
+            self._comp,
+            zl.graphs.Compress(),
+        )
+        self._comp.select_starting_graph(gid)
+
+    def __call__(self, np_bytes: np.ndarray) -> bytes:
+        if not isinstance(np_bytes, np.ndarray):
+            raise TypeError("Expected NumPy array")
+        if np_bytes.dtype not in (np.byte, np.int8, np.uint8):
+            raise TypeError("Expected byte/int8/uint8 array")
+
+        b = np_bytes.tobytes(order="C")
+        cctx = zl.CCtx()
+        cctx.ref_compressor(self._comp)
+        cctx.set_parameter(zl.CParam.FormatVersion, zl.MAX_FORMAT_VERSION)
+        return cctx.compress([zl.Input(zl.Type.Serial, b)])
+
+
+# ============================================================
 # Reconstruction helpers
 # ============================================================
 
@@ -405,7 +472,7 @@ def _unpack_tdt_packed_bytes_to_float(
     for i in range(m):
         raw[i:m * n:m] = comps_recovered[i]
 
-    return raw.view(dtype)
+    return raw.view(dtype).copy()
 
 
 def _restore_grouped_bytes_to_array(
@@ -417,7 +484,7 @@ def _restore_grouped_bytes_to_array(
     no_reorder_layout: bool,
 ) -> np.ndarray:
     """
-    Unified restore entry point.
+    Unified restore entry point for packed grouped layout.
     """
     if no_reorder_layout:
         return _restore_no_reorder_bytes_to_array(
@@ -433,3 +500,43 @@ def _restore_grouped_bytes_to_array(
         n=n,
         dtype=dtype,
     )
+
+
+def _restore_separated_grouped_bytes_to_array(
+    separated_group_serials,
+    group_lens,
+    decomp,
+    n: int,
+    dtype,
+) -> np.ndarray:
+    """
+    Restore original array from separate group streams.
+
+    Each separated_group_serials[g] contains n records,
+    each record width = group_lens[g].
+
+    We rebuild byte-planes in original order, then cast back to dtype.
+    """
+    group_lens = [int(x) for x in group_lens]
+    m = int(sum(group_lens))
+
+    out_planes = np.empty((m, n), dtype=np.uint8)
+
+    if len(separated_group_serials) != len(group_lens):
+        raise ValueError("Mismatch between separated_group_serials and group_lens")
+
+    for serial, group, gl in zip(separated_group_serials, decomp, group_lens):
+        buf = np.frombuffer(np.asarray(serial, dtype=np.byte).tobytes(), dtype=np.uint8)
+        if buf.size != n * gl:
+            raise ValueError(f"Unexpected separated group size: got {buf.size}, expected {n * gl}")
+
+        part = buf.reshape((n, gl)).T
+
+        for local_idx, global_plane in enumerate(group):
+            out_planes[int(global_plane), :] = part[local_idx, :]
+
+    raw = np.empty(m * n, dtype=np.uint8)
+    for i in range(m):
+        raw[i:m * n:m] = out_planes[i]
+
+    return raw.view(dtype).copy()

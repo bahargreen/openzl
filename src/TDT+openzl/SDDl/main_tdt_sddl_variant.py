@@ -3,6 +3,7 @@
 Main benchmark script for:
 - standard SDDL
 - grouped / decomposed SDDL
+- reorder-only + standard SDDL
 
 This script reports:
 - compression ratio
@@ -11,12 +12,22 @@ This script reports:
 - full restore time / MB/s
 - full restore correctness
 
-It is designed to work with:
+Variant meanings:
+1) standard SDDL
+   original serial bytes -> standard SDDL(m-byte records)
+
+2) grouped / decomposed SDDL
+   byte-plane regrouping -> grouped packed bytes -> grouped SDDL(field-aware)
+
+3) reorder-only + standard SDDL
+   byte-plane regrouping -> grouped packed bytes -> standard SDDL(m-byte records)
+   restore uses decomp metadata outside SDDL
+
+Designed to work with:
     openzl_sddl_helpers.py
 """
 
 import os
-import itertools
 import time
 import numpy as np
 import pandas as pd
@@ -40,14 +51,11 @@ import openzl_sddl_helpers as sddlh
 # CONFIG
 # ============================================================
 
-DATASET_FOLDER = "/home/jamalids/Documents/2D/data1/Fcbench/Fcbench-dataset/32"
-OUT_LOG_DIR = "/home/jamalids/Documents/4"
+DATASET_FOLDER = "/home/jamalids/Documents/2D/data1/Fcbench/Fcbench-dataset/32/34"
+OUT_LOG_DIR = "/home/jamalids/Documents/8"
 
 # type width: 2=float16, 4=float32, 8=float64
 M = 4
-
-# if given_decomp is None, enumerate decompositions
-CONTIG_ORDER = False
 
 # optional single-dataset filter, e.g. "citytemp_f32"
 ONLY_DATASET = None
@@ -55,16 +63,16 @@ ONLY_DATASET = None
 # helper configs
 sddlh.N_WARMUP = 1
 sddlh.N_RUNS = 10
-sddlh.SDDL_MAX_RECORDS_PER_CHUNK = 2000_0000
-sddlh.SDDL_MBPS_DENOM = "aligned"   # "aligned" or "orig"
+sddlh.SDDL_MAX_RECORDS_PER_CHUNK = 2_000_000
+sddlh.SDDL_MBPS_DENOM = "orig"   # "aligned" or "orig"
 
 
 # ============================================================
-# Decomposition configs
+# Byte Grouped (Static Clustering)
 # ============================================================
 
 compConfigMap = {
-    "acs_wht_f32": [[[1, 2], [3], [4]]],
+    "acs_wht_f32": [[[1, 2], [3], [4]], [[3], [1, 2], [4]], [[4], [3], [1, 2]], [[4], [3], [2, 1]]],
     "g24_78_usb2_f32": [[[1, 2, 3], [4]]],
     "jw_mirimage_f32": [[[1, 2, 3], [4]]],
     "spitzer_irac_f32": [[[1, 2], [3], [4]]],
@@ -72,14 +80,14 @@ compConfigMap = {
     "wave_f32": [[[1, 2], [3], [4]]],
     "hdr_night_f32": [[[1, 4], [2], [3]]],
     "ts_gas_f32": [[[1], [2, 3], [4]]],
-    "solar_wind_f32": [[[1], [2, 3], [4]]],
+    "solar_wind_f32": [[[1], [2, 3], [4]], [[1, 2, 3], [4]], [[1], [2], [3], [4]]],
     "tpch_lineitem_f32": [[[1, 2, 3], [4]]],
     "tpcds_web_f32": [[[4], [1, 2, 3]]],
     "tpcds_store_f32": [[[1, 2, 3], [4]]],
     "tpcds_catalog_f32": [[[1, 2], [3], [4]]],
-    "citytemp_f32": [[[1, 2], [3], [4]]],
-    "hst_wfc3_ir_f32": [[[1, 2], [3], [4]]],
-    "hst_wfc3_uvis_f32": [[[1, 2], [3], [4]]],
+    "citytemp_f32": [[[1, 2], [3], [4]], [[3], [1, 2], [4]], [[4], [3], [1, 2]], [[4], [3], [2, 1]]],
+    "hst_wfc3_ir_f32": [[[1, 2], [3], [4]], [[1, 2, 3], [4]],[[1, 4], [3], [2]]],
+    "hst_wfc3_uvis_f32": [[[1, 2], [3], [4]], [[1, 2, 3], [4]]],
     "rsim_f32": [[[1, 2], [3], [4]]],
     "astro_mhd_f64": [[[1, 2, 3, 4, 5, 6], [7], [8]]],
     "astro_pt_f64": [[[1, 2, 3, 4, 5, 6], [7], [8]]],
@@ -98,51 +106,7 @@ compConfigMap = {
 
 
 # ============================================================
-# Enumeration helpers
-# ============================================================
-
-def possible_sum(m: int):
-    possible_sets = []
-    for i in range(1, m + 1):
-        if i == m:
-            possible_sets.append([i])
-        else:
-            for j in possible_sum(m - i):
-                possible_sets.append([i] + j)
-    return possible_sets
-
-
-def merge_order_with_decomposition(order, decomposition):
-    cur_len = 0
-    merged_order = set()
-    for comp_len in decomposition:
-        comp_len = int(comp_len)
-        cur_comp = tuple(order[cur_len:cur_len + comp_len])
-        merged_order.add(cur_comp)
-        cur_len += comp_len
-    return merged_order
-
-
-def find_all_combinations(all_possible_consecutive_comp, m, contiguous=True):
-    byte_loc = np.arange(0, m)
-    if contiguous:
-        all_permutations = [tuple(range(0, m))]
-    else:
-        all_permutations = list(itertools.permutations(byte_loc))
-
-    all_decomposition = []
-    for composition in all_possible_consecutive_comp:
-        for permutation in all_permutations:
-            cur_comp = merge_order_with_decomposition(permutation, composition)
-            all_decomposition.append(cur_comp)
-
-    all_perm_length = len(all_decomposition)
-    all_decomposition = list(set([tuple(x) for x in all_decomposition]))
-    return all_decomposition, all_perm_length
-
-
-# ============================================================
-# Local timing helpers for full restore
+# Local timing helpers
 # ============================================================
 
 def _median_time_local(callable_fn) -> float:
@@ -220,10 +184,11 @@ def _full_restore_grouped_sddl_time(
     expected_data: np.ndarray,
     record_size: int,
     max_records: int,
+    no_reorder_layout: bool,
 ) -> tuple[int, float, int, bool]:
     """
     Full restore time for grouped/decomposed SDDL:
-        decompress -> inverse grouping -> reconstruct float -> verify
+        decompress -> restore grouped bytes -> reconstruct float -> verify
     """
     record_size = int(record_size)
     max_records = int(max_records)
@@ -263,12 +228,13 @@ def _full_restore_grouped_sddl_time(
         restored_parts = []
         for comp, nrec in zip(compressed_chunks, chunk_record_counts):
             regen = sddlh._decompress_serial_bytes(comp)
-            x_part = sddlh._unpack_tdt_packed_bytes_to_float(
+            x_part = sddlh._restore_grouped_bytes_to_array(
                 packed_serial=regen,
                 group_lens=group_lens,
                 decomp=decomp,
                 n=nrec,
                 dtype=expected_data.dtype,
+                no_reorder_layout=no_reorder_layout,
             )
             restored_parts.append(x_part)
 
@@ -276,16 +242,107 @@ def _full_restore_grouped_sddl_time(
         if not np.array_equal(x_all, expected_data):
             raise RuntimeError("grouped SDDL full restore mismatch")
 
-    # correctness once before timing
     restored_parts = []
     for comp, nrec in zip(compressed_chunks, chunk_record_counts):
         regen = sddlh._decompress_serial_bytes(comp)
-        x_part = sddlh._unpack_tdt_packed_bytes_to_float(
+        x_part = sddlh._restore_grouped_bytes_to_array(
             packed_serial=regen,
             group_lens=group_lens,
             decomp=decomp,
             n=nrec,
             dtype=expected_data.dtype,
+            no_reorder_layout=no_reorder_layout,
+        )
+        restored_parts.append(x_part)
+
+    x_all = np.concatenate(restored_parts, axis=0)
+    ok = np.array_equal(x_all, expected_data)
+
+    if not ok:
+        return int(compressed_total), 0.0, int(nbytes_aligned), False
+
+    dt = _median_time_local(timed_pass)
+    return int(compressed_total), float(dt), int(nbytes_aligned), True
+
+
+def _full_restore_reorder_only_standard_sddl_time(
+    tool,
+    packed_bytes_F: np.ndarray,
+    group_lens,
+    decomp,
+    expected_data: np.ndarray,
+    record_size: int,
+    max_records: int,
+    no_reorder_layout: bool,
+) -> tuple[int, float, int, bool]:
+    """
+    Full restore time for reorder-only + standard SDDL:
+        decompress reordered packed bytes -> restore original float array -> verify
+
+    Here SDDL only sees plain record_size=m bytes per record.
+    """
+    record_size = int(record_size)
+    max_records = int(max_records)
+
+    nbytes = int(packed_bytes_F.size)
+    nbytes_aligned = nbytes - (nbytes % record_size)
+    if nbytes_aligned <= 0:
+        return 0, 0.0, 0, False
+
+    packed_bytes_F = packed_bytes_F[:nbytes_aligned]
+    chunk_bytes = record_size * max_records
+
+    compressed_chunks = []
+    chunk_record_counts = []
+
+    off = 0
+    while off < nbytes_aligned:
+        end = min(off + chunk_bytes, nbytes_aligned)
+        end = end - ((end - off) % record_size)
+        if end <= off:
+            break
+
+        chunk = packed_bytes_F[off:end]
+        comp = tool(chunk)
+
+        regen = sddlh._decompress_serial_bytes(comp)
+        if regen != chunk.tobytes(order="C"):
+            return 0, 0.0, nbytes_aligned, False
+
+        compressed_chunks.append(comp)
+        chunk_record_counts.append((end - off) // record_size)
+        off = end
+
+    compressed_total = sum(len(x) for x in compressed_chunks)
+
+    def timed_pass():
+        restored_parts = []
+        for comp, nrec in zip(compressed_chunks, chunk_record_counts):
+            regen = sddlh._decompress_serial_bytes(comp)
+            x_part = sddlh._restore_grouped_bytes_to_array(
+                packed_serial=regen,
+                group_lens=group_lens,
+                decomp=decomp,
+                n=nrec,
+                dtype=expected_data.dtype,
+                no_reorder_layout=no_reorder_layout,
+            )
+            restored_parts.append(x_part)
+
+        x_all = np.concatenate(restored_parts, axis=0)
+        if not np.array_equal(x_all, expected_data):
+            raise RuntimeError("reorder-only + standard SDDL full restore mismatch")
+
+    restored_parts = []
+    for comp, nrec in zip(compressed_chunks, chunk_record_counts):
+        regen = sddlh._decompress_serial_bytes(comp)
+        x_part = sddlh._restore_grouped_bytes_to_array(
+            packed_serial=regen,
+            group_lens=group_lens,
+            decomp=decomp,
+            n=nrec,
+            dtype=expected_data.dtype,
+            no_reorder_layout=no_reorder_layout,
         )
         restored_parts.append(x_part)
 
@@ -306,30 +363,23 @@ def _full_restore_grouped_sddl_time(
 def test_decomposition(
     data_set: np.ndarray,
     dataset_name: str,
-    given_decomp=None,
+    given_decomp,
     m=4,
     chunk_no=-1,
-    contig_order=True,
     out_log_dir="/home/jamalids/Documents/1",
 ):
-    type_byte = np.uint8
     m = int(m)
 
-    if given_decomp is None:
-        all_possible = possible_sum(m)
-        all_decomps, total_enum = find_all_combinations(all_possible, m, contig_order)
-    else:
-        all_decomps = list(given_decomp)
-        total_enum = len(all_decomps)
+    if not given_decomp:
+        raise ValueError(f"No decomposition config found for dataset '{dataset_name}'")
 
-    data_set_bytes = data_set.view(type_byte)
-    len_bytes = int(data_set_bytes.nbytes)
+    all_decomps = list(given_decomp)
+    total_enum = len(all_decomps)
+
+    len_bytes = int(data_set.nbytes)
     n = int(len(data_set))
 
-    # original byte-planes once
-    comps = np.zeros((m, n), dtype=type_byte)
-    for i in range(m):
-        comps[i] = data_set_bytes[i:len_bytes:m]
+    byte_planes = sddlh._byte_planes_view(data_set, m)
 
     sddl_groups_cache = {}
     sddl_standard_cache = {}
@@ -349,12 +399,37 @@ def test_decomposition(
     def ratio(orig: int, comp: int) -> float:
         return float("inf") if comp == 0 else float(orig) / float(comp)
 
-    # original serial layout
-    std_serial_F = np.frombuffer(data_set.flatten("F").tobytes(), dtype=np.byte)
+    std_serial_F = np.frombuffer(data_set.tobytes(), dtype=np.byte)
+
+    # standard SDDL is computed once per dataset
+    standard_sddl_tool = get_standard_sddl_tool(m)
+
+    std_sddl_size, std_sddl_t, std_sddl_nproc = sddlh._core_time_and_size_sddl_chunked(
+        standard_sddl_tool,
+        std_serial_F,
+        record_size=m,
+        max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+    )
+
+    _, std_sddl_dt, std_sddl_dproc = sddlh._core_time_and_check_decompress_sddl_chunked(
+        standard_sddl_tool,
+        std_serial_F,
+        record_size=m,
+        max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+    )
+
+    _, std_sddl_full_t, std_sddl_full_proc, std_ok = _full_restore_standard_sddl_time(
+        standard_sddl_tool,
+        std_serial_F,
+        record_size=m,
+        max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+    )
 
     stat_array = []
 
     for idx, decomp in enumerate(all_decomps):
+        decomp = tuple(tuple(int(x) for x in g) for g in decomp)
+
         stats = {
             "dataset name": dataset_name,
             "original size": len_bytes,
@@ -364,62 +439,22 @@ def test_decomposition(
             "chunk no": int(chunk_no),
         }
 
-        # --------------------------------------------------------
-        # Build grouped byte chunks from decomposition
-        # --------------------------------------------------------
-        comp_list = []
-        group_lens = []
+        no_reorder_layout = sddlh._is_no_reorder_decomp(decomp, m)
 
-        for group_tuple in decomp:
-            group_tuple = tuple(group_tuple)
-            gl = len(group_tuple)
-            group_lens.append(gl)
-
-            cur_comp_data = np.zeros((gl, n), dtype=type_byte)
-            for j, byte_idx in enumerate(group_tuple):
-                cur_comp_data[j] = comps[int(byte_idx)]
-            comp_list.append(cur_comp_data)
-
+        group_lens = [len(g) for g in decomp]
         K = int(sum(group_lens))
 
-        # --------------------------------------------------------
-        # Packed layout for grouped SDDL, col-order only
-        # --------------------------------------------------------
-        packed = np.zeros((K, n), dtype=type_byte)
-        off = 0
-        for chunk in comp_list:
-            gl = int(chunk.shape[0])
-            packed[off:off + gl, :] = chunk
-            off += gl
+        if no_reorder_layout:
+            packed_bytes_F = std_serial_F
+        else:
+            packed_bytes_F, group_lens, K = sddlh._build_grouped_packed_bytes_col_fast(
+                byte_planes=byte_planes,
+                decomp=decomp,
+            )
 
-        packed_bytes_F = np.frombuffer(packed.flatten("F").tobytes(), dtype=np.byte)
-
-        # ========================================================
-        # 1) Standard SDDL
-        # ========================================================
-        standard_sddl_tool = get_standard_sddl_tool(m)
-
-        std_sddl_size, std_sddl_t, std_sddl_nproc = sddlh._core_time_and_size_sddl_chunked(
-            standard_sddl_tool,
-            std_serial_F,
-            record_size=m,
-            max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
-        )
-
-        _, std_sddl_dt, std_sddl_dproc = sddlh._core_time_and_check_decompress_sddl_chunked(
-            standard_sddl_tool,
-            std_serial_F,
-            record_size=m,
-            max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
-        )
-
-        _, std_sddl_full_t, std_sddl_full_proc, std_ok = _full_restore_standard_sddl_time(
-            standard_sddl_tool,
-            std_serial_F,
-            record_size=m,
-            max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
-        )
-
+        # ------------------------------------------------------------
+        # standard SDDL
+        # ------------------------------------------------------------
         stats["standard openzl_sddl ratio"] = ratio(len_bytes, std_sddl_size)
         stats["standard openzl_sddl comp time s"] = float(std_sddl_t)
         stats["standard openzl_sddl core decomp time s"] = float(std_sddl_dt)
@@ -436,9 +471,9 @@ def test_decomposition(
 
         stats["standard openzl_sddl full restore correctness"] = bool(std_ok)
 
-        # ========================================================
-        # 2) Grouped / decomposed SDDL, col-order only
-        # ========================================================
+        # ------------------------------------------------------------
+        # grouped / decomposed SDDL
+        # ------------------------------------------------------------
         sddl_tool = get_sddl_groups_tool(group_lens)
 
         sddl_size_F, t_sddl_F, nproc_F = sddlh._core_time_and_size_sddl_chunked(
@@ -463,6 +498,7 @@ def test_decomposition(
             expected_data=data_set,
             record_size=K,
             max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+            no_reorder_layout=no_reorder_layout,
         )
 
         stats["grouped openzl_sddl col-order ratio"] = ratio(len_bytes, sddl_size_F)
@@ -480,9 +516,56 @@ def test_decomposition(
             stats["grouped openzl_sddl col-order full restore MB/s"] = sddlh._mbps(fullproc_F, t_sddl_full_F)
 
         stats["grouped openzl_sddl col-order full restore correctness"] = bool(ok_F)
+        stats["grouped openzl_sddl uses no-reorder fast path"] = bool(no_reorder_layout)
         stats["grouped openzl_sddl group count"] = int(len(group_lens))
         stats["grouped openzl_sddl total packed width"] = int(K)
         stats["grouped openzl_sddl group lens"] = list_to_string(group_lens)
+
+        # ------------------------------------------------------------
+        # reorder-only + standard SDDL
+        # ------------------------------------------------------------
+        reorder_std_tool = get_standard_sddl_tool(m)
+
+        reorder_std_size, reorder_std_t, reorder_std_nproc = sddlh._core_time_and_size_sddl_chunked(
+            reorder_std_tool,
+            packed_bytes_F,
+            record_size=m,
+            max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+        )
+
+        _, reorder_std_dt, reorder_std_dproc = sddlh._core_time_and_check_decompress_sddl_chunked(
+            reorder_std_tool,
+            packed_bytes_F,
+            record_size=m,
+            max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+        )
+
+        _, reorder_std_full_t, reorder_std_full_proc, reorder_std_ok = _full_restore_reorder_only_standard_sddl_time(
+            reorder_std_tool,
+            packed_bytes_F=packed_bytes_F,
+            group_lens=group_lens,
+            decomp=decomp,
+            expected_data=data_set,
+            record_size=m,
+            max_records=sddlh.SDDL_MAX_RECORDS_PER_CHUNK,
+            no_reorder_layout=no_reorder_layout,
+        )
+
+        stats["reorder-only standard openzl_sddl ratio"] = ratio(len_bytes, reorder_std_size)
+        stats["reorder-only standard openzl_sddl comp time s"] = float(reorder_std_t)
+        stats["reorder-only standard openzl_sddl core decomp time s"] = float(reorder_std_dt)
+        stats["reorder-only standard openzl_sddl full restore time s"] = float(reorder_std_full_t)
+
+        if sddlh.SDDL_MBPS_DENOM == "orig":
+            stats["reorder-only standard openzl_sddl comp MB/s"] = sddlh._mbps(len_bytes, reorder_std_t)
+            stats["reorder-only standard openzl_sddl core decomp MB/s"] = sddlh._mbps(len_bytes, reorder_std_dt)
+            stats["reorder-only standard openzl_sddl full restore MB/s"] = sddlh._mbps(len_bytes, reorder_std_full_t)
+        else:
+            stats["reorder-only standard openzl_sddl comp MB/s"] = sddlh._mbps(reorder_std_nproc, reorder_std_t)
+            stats["reorder-only standard openzl_sddl core decomp MB/s"] = sddlh._mbps(reorder_std_dproc, reorder_std_dt)
+            stats["reorder-only standard openzl_sddl full restore MB/s"] = sddlh._mbps(reorder_std_full_proc, reorder_std_full_t)
+
+        stats["reorder-only standard openzl_sddl full restore correctness"] = bool(reorder_std_ok)
 
         stat_array.append(stats)
 
@@ -501,7 +584,6 @@ def test_decomposition(
 def main():
     dataset_folder = DATASET_FOLDER
     m = M
-    contig_order = CONTIG_ORDER
     out_log_dir = OUT_LOG_DIR
 
     if not os.path.isdir(dataset_folder):
@@ -549,7 +631,6 @@ def main():
             dataset_name=dataset_name,
             m=m,
             given_decomp=converted_decomps,
-            contig_order=contig_order,
             out_log_dir=out_log_dir,
         )
 
