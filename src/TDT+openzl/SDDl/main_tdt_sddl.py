@@ -303,7 +303,7 @@ def test_decomposition(
 
     std_serial_F = np.frombuffer(data_set.tobytes(), dtype=np.byte)
 
-    # standard SDDL را فقط یک بار برای کل dataset حساب کن
+    # standard SDDL
     standard_sddl_tool = get_standard_sddl_tool(m)
 
     std_sddl_size, std_sddl_t, std_sddl_nproc = sddlh._core_time_and_size_sddl_chunked(
